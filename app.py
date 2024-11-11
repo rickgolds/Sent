@@ -9,7 +9,7 @@ def analyze_sentiment():
 root = tk.Tk()
 root.title("Analiza sentymentu")
 
-# Pole tekstowe do wpisania recenzjierff
+# Pole tekstowe do wpisania recenzjierffsdafsf
 label = tk.Label(root, text="Wprowadz recenzje:")
 label.pack()
 
