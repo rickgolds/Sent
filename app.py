@@ -1,10 +1,20 @@
 import tkinter as tk
 from PIL import Image, ImageTk
 import re
-import csv
+import pandas as pd
+import numpy as np
 import math
 import random
-from collections import Counter
+from nltk.corpus import stopwords
+from nltk.util import ngrams
+import nltk
+
+# Upewnij się, że stopwords zostały pobrane
+nltk.download('stopwords')
+stop_words = set(stopwords.words('english'))
+# Usunięcie negacji z stopwords
+negation_words = {"not", "no", "never", "wasn't"}
+stop_words -= negation_words
 
 # Przykładowe recenzje
 positive_reviews = [
@@ -25,43 +35,38 @@ negative_reviews = [
 
 # Funkcja do wczytania danych z pliku CSV
 def load_data(filename, limit=1000):
-    reviews, sentiments = [], []
-    with open('imdb.csv', 'r', encoding='utf-8') as file:
-        reader = csv.DictReader(file)
-        for i, row in enumerate(reader):
-            if i >= limit:
-                break
-            reviews.append(row['review'])
-            sentiments.append(1 if row['sentiment'] == 'positive' else 0)
-    return reviews, sentiments
+    data = pd.read_csv('imdb.csv', nrows=limit)
+    data['review'] = data['review'].apply(preprocess_text)
+    data['sentiment'] = data['sentiment'].apply(lambda x: 1 if x == 'positive' else 0)
+    return data['review'].tolist(), data['sentiment'].tolist()
 
 # Funkcja przetwarzania tekstu
 def preprocess_text(text):
-    stopwords = {"a", "an", "the", "and", "is", "in", "it", "of", "to", "was", "with"}
-    text = re.sub(r'[^a-zA-Z ]', '', text).lower()
+    text = re.sub(r'<.*?>', '', text)  # Usuwa znaczniki HTML
+    text = re.sub(r'http\S+|www\.\S+', '', text)  # Usuwa linki
+    text = re.sub(r'[^a-zA-Z ]', '', text).lower()  # Usuwa znaki nieliterowe i konwertuje na małe litery
+    text = re.sub(r'\s+', ' ', text).strip()  # Usuwa dodatkowe białe znaki
     words = text.split()
-    return [word for word in words if word not in stopwords]
-
-# Funkcja do konwersji recenzji na wektor cech
-def vectorize_reviews(reviews, vocab):
-    vectors = []
-    for review in reviews:
-        vector = [0] * len(vocab)
-        words = preprocess_text(review)
-        for word in words:
-            if word in vocab:
-                vector[vocab[word]] += 1
-        vectors.append(vector)
-    return vectors
+    # Użycie bigramów
+    bigrams = ['_'.join(gram) for gram in ngrams(words, 2)]
+    words.extend(bigrams)
+    return ' '.join([word for word in words if word not in stop_words])
 
 # Funkcja do ograniczenia słownika do najczęściej występujących słów
 def build_vocab(reviews, max_vocab_size=5000):
-    word_counter = Counter()
-    for review in reviews:
-        words = preprocess_text(review)
-        word_counter.update(words)
-    most_common = word_counter.most_common(max_vocab_size)
-    return {word: i for i, (word, _) in enumerate(most_common)}
+    all_words = ' '.join(reviews).split()
+    word_counts = pd.Series(all_words).value_counts()
+    vocab = {word: i for i, word in enumerate(word_counts.head(max_vocab_size).index)}
+    return vocab
+
+# Funkcja do konwersji recenzji na wektor cech
+def vectorize_reviews(reviews, vocab):
+    vectors = np.zeros((len(reviews), len(vocab)))
+    for i, review in enumerate(reviews):
+        for word in review.split():
+            if word in vocab:
+                vectors[i, vocab[word]] += 1
+    return vectors
 
 # Implementacja MLP
 class MLP:
@@ -69,51 +74,31 @@ class MLP:
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.weights_input_hidden = [[random.uniform(-0.5, 0.5) for _ in range(hidden_size)] for _ in range(input_size)]
-        self.weights_hidden_output = [[random.uniform(-0.5, 0.5) for _ in range(output_size)] for _ in range(hidden_size)]
-        self.bias_hidden = [random.uniform(-0.5, 0.5) for _ in range(hidden_size)]
-        self.bias_output = [random.uniform(-0.5, 0.5) for _ in range(output_size)]
+        self.weights_input_hidden = np.random.uniform(-0.5, 0.5, (input_size, hidden_size))
+        self.weights_hidden_output = np.random.uniform(-0.5, 0.5, (hidden_size, output_size))
+        self.bias_hidden = np.random.uniform(-0.5, 0.5, hidden_size)
+        self.bias_output = np.random.uniform(-0.5, 0.5, output_size)
 
     def sigmoid(self, x):
-        x = max(-700, min(700, x))
-        return 1 / (1 + math.exp(-x))
+        x = np.clip(x, -700, 700)
+        return 1 / (1 + np.exp(-x))
 
     def sigmoid_derivative(self, x):
         return x * (1 - x)
 
     def forward(self, inputs):
-        self.hidden_layer = [0] * self.hidden_size
-        for i in range(self.hidden_size):
-            self.hidden_layer[i] = sum(inputs[j] * self.weights_input_hidden[j][i] for j in range(self.input_size)) + self.bias_hidden[i]
-            self.hidden_layer[i] = self.sigmoid(self.hidden_layer[i])
-
-        self.output_layer = [0] * self.output_size
-        for i in range(self.output_size):
-            self.output_layer[i] = sum(self.hidden_layer[j] * self.weights_hidden_output[j][i] for j in range(self.hidden_size)) + self.bias_output[i]
-            self.output_layer[i] = self.sigmoid(self.output_layer[i])
-
+        self.hidden_layer = self.sigmoid(np.dot(inputs, self.weights_input_hidden) + self.bias_hidden)
+        self.output_layer = self.sigmoid(np.dot(self.hidden_layer, self.weights_hidden_output) + self.bias_output)
         return self.output_layer
 
     def backward(self, inputs, targets, learning_rate):
-        output_errors = [targets[i] - self.output_layer[i] for i in range(self.output_size)]
-        hidden_errors = [0] * self.hidden_size
+        output_errors = targets - self.output_layer
+        hidden_errors = np.dot(output_errors, self.weights_hidden_output.T) * self.sigmoid_derivative(self.hidden_layer)
 
-        for i in range(self.hidden_size):
-            for j in range(self.output_size):
-                hidden_errors[i] += output_errors[j] * self.weights_hidden_output[i][j]
-
-        for i in range(self.hidden_size):
-            for j in range(self.output_size):
-                self.weights_hidden_output[i][j] += learning_rate * output_errors[j] * self.hidden_layer[i]
-
-        for i in range(self.input_size):
-            for j in range(self.hidden_size):
-                self.weights_input_hidden[i][j] += learning_rate * hidden_errors[j] * inputs[i]
-
-        for i in range(self.hidden_size):
-            self.bias_hidden[i] += learning_rate * hidden_errors[i]
-        for i in range(self.output_size):
-            self.bias_output[i] += learning_rate * output_errors[i]
+        self.weights_hidden_output += learning_rate * np.dot(self.hidden_layer[:, np.newaxis], output_errors[np.newaxis, :])
+        self.weights_input_hidden += learning_rate * np.dot(inputs[:, np.newaxis], hidden_errors[np.newaxis, :])
+        self.bias_hidden += learning_rate * hidden_errors
+        self.bias_output += learning_rate * output_errors
 
     def train(self, inputs, targets, epochs, learning_rate):
         for epoch in range(epochs):
@@ -121,52 +106,21 @@ class MLP:
                 self.forward(inputs[i])
                 self.backward(inputs[i], targets[i], learning_rate)
 
-# Funkcja generowania raportu klasyfikacji
-def classification_report(mlp, input_vectors, targets):
-    true_positives = 0
-    false_positives = 0
-    true_negatives = 0
-    false_negatives = 0
-
-    for i in range(len(input_vectors)):
-        prediction = mlp.forward(input_vectors[i])[0]
-        predicted_label = 1 if prediction > 0.5 else 0
-        true_label = targets[i][0]
-
-        if predicted_label == 1 and true_label == 1:
-            true_positives += 1
-        elif predicted_label == 1 and true_label == 0:
-            false_positives += 1
-        elif predicted_label == 0 and true_label == 0:
-            true_negatives += 1
-        elif predicted_label == 0 and true_label == 1:
-            false_negatives += 1
-
-    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-
-    print("Classification Report:")
-    print(f"Precision: {precision:.2f}")
-    print(f"Recall: {recall:.2f}")
-    print(f"F1 Score: {f1_score:.2f}")
-
 # Wczytanie danych
-reviews, sentiments = load_data('imdb.csv', limit=5000)  # Ograniczenie do 1000 recenzji
-vocab = build_vocab(reviews, max_vocab_size=10000)  # Ograniczenie słownika
+reviews, sentiments = load_data('imdb.csv', limit=15000)
+vocab = build_vocab(reviews, max_vocab_size=20000)
 input_vectors = vectorize_reviews(reviews, vocab)
 
 # Inicjalizacja i trenowanie modelu
-mlp = MLP(len(vocab), 10, 1)
-mlp.train(input_vectors, [[s] for s in sentiments], epochs=10, learning_rate=0.1)
+mlp = MLP(input_vectors.shape[1], 10, 1)
+mlp.train(input_vectors, np.array(sentiments).reshape(-1, 1), epochs=10, learning_rate=0.1)
 
-# Wygenerowanie raportu klasyfikacji
-classification_report(mlp, input_vectors, [[s] for s in sentiments])
-
+# Funkcja analizy recenzji
 def analyze_sentiment():
     review = entry.get("1.0", tk.END).strip()  # Pobiera tekst z pola
     if review:
-        vector = vectorize_reviews([review], vocab)[0]
+        preprocessed_review = preprocess_text(review)
+        vector = vectorize_reviews([preprocessed_review], vocab)[0]
         prediction = mlp.forward(vector)[0]
         sentiment = "Positive" if prediction > 0.5 else "Negative"
         print(f"Review sentiment: {sentiment}")
